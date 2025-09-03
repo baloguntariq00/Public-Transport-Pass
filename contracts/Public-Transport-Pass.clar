@@ -7,6 +7,8 @@
 (define-constant ERR_INVALID_AMOUNT (err u106))
 (define-constant ERR_PASS_NOT_FOUND (err u107))
 (define-constant ERR_INVALID_ZONE (err u108))
+(define-constant ERR_INSUFFICIENT_POINTS (err u109))
+(define-constant ERR_INVALID_TIER (err u110))
 
 (define-constant PASS_TYPE_DAILY u1)
 (define-constant PASS_TYPE_WEEKLY u2)
@@ -20,6 +22,12 @@
 (define-constant DAILY_DURATION u144)
 (define-constant WEEKLY_DURATION u1008)
 (define-constant MONTHLY_DURATION u4320)
+
+(define-constant POINTS_PER_RIDE u10)
+(define-constant BRONZE_TIER_MIN u0)
+(define-constant SILVER_TIER_MIN u500)
+(define-constant GOLD_TIER_MIN u1500)
+(define-constant PLATINUM_TIER_MIN u3000)
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var pass-counter uint u0)
@@ -63,6 +71,25 @@
     uint
 )
 
+(define-map loyalty-points
+    principal
+    {
+        total-points: uint,
+        lifetime-points: uint,
+        tier: uint,
+        last-activity: uint,
+    }
+)
+
+(define-map tier-benefits
+    uint
+    {
+        discount-percentage: uint,
+        bonus-points-multiplier: uint,
+        free-rides-monthly: uint,
+    }
+)
+
 (define-private (get-pass-cost (pass-type uint))
     (if (is-eq pass-type PASS_TYPE_DAILY)
         DAILY_PASS_COST
@@ -103,6 +130,74 @@
 
 (define-private (is-owner)
     (is-eq tx-sender (var-get contract-owner))
+)
+
+(define-private (calculate-user-tier (lifetime-points uint))
+    (if (>= lifetime-points PLATINUM_TIER_MIN)
+        u4
+        (if (>= lifetime-points GOLD_TIER_MIN)
+            u3
+            (if (>= lifetime-points SILVER_TIER_MIN)
+                u2
+                u1
+            )
+        )
+    )
+)
+
+(define-private (get-tier-discount (tier uint))
+    (if (is-eq tier u4)
+        u20
+        (if (is-eq tier u3)
+            u15
+            (if (is-eq tier u2)
+                u10
+                u0
+            )
+        )
+    )
+)
+
+(define-private (get-points-multiplier (tier uint))
+    (if (is-eq tier u4)
+        u3
+        (if (is-eq tier u3)
+            u2
+            (if (is-eq tier u2)
+                u2
+                u1
+            )
+        )
+    )
+)
+
+(define-private (award-points-for-ride
+        (user principal)
+        (base-points uint)
+    )
+    (let (
+            (current-data (default-to {
+                total-points: u0,
+                lifetime-points: u0,
+                tier: u1,
+                last-activity: u0,
+            }
+                (map-get? loyalty-points user)
+            ))
+            (new-lifetime-points (+ (get lifetime-points current-data) base-points))
+            (new-tier (calculate-user-tier new-lifetime-points))
+            (multiplier (get-points-multiplier new-tier))
+            (bonus-points (* base-points multiplier))
+            (new-total-points (+ (get total-points current-data) bonus-points))
+        )
+        (map-set loyalty-points user {
+            total-points: new-total-points,
+            lifetime-points: new-lifetime-points,
+            tier: new-tier,
+            last-activity: burn-block-height,
+        })
+        (ok bonus-points)
+    )
 )
 
 (define-private (add-pass-to-user
@@ -218,7 +313,10 @@
             cost: ride-cost,
         })
 
-        (ok ride-id)
+        (begin
+            (unwrap-panic (award-points-for-ride tx-sender POINTS_PER_RIDE))
+            (ok ride-id)
+        )
     )
 )
 
@@ -303,6 +401,72 @@
     )
 )
 
+(define-public (redeem-points-for-discount
+        (points-to-redeem uint)
+        (pass-type uint)
+        (zone uint)
+    )
+    (let (
+            (user-data (unwrap! (map-get? loyalty-points tx-sender) ERR_PASS_NOT_FOUND))
+            (cost (get-pass-cost pass-type))
+            (discount-rate u50)
+            (discounted-cost (- cost (/ (* cost discount-rate) u100)))
+            (new-pass-id (+ (var-get pass-counter) u1))
+            (duration (get-pass-duration pass-type))
+            (current-block burn-block-height)
+            (expiry-block (+ current-block duration))
+        )
+        (asserts! (>= (get total-points user-data) points-to-redeem)
+            ERR_INSUFFICIENT_POINTS
+        )
+        (asserts! (>= points-to-redeem (* cost u10)) ERR_INVALID_AMOUNT)
+        (asserts! (> cost u0) ERR_INVALID_PASS_TYPE)
+        (asserts! (> zone u0) ERR_INVALID_ZONE)
+
+        (try! (stx-transfer? discounted-cost tx-sender (var-get contract-owner)))
+
+        (map-set passes new-pass-id {
+            owner: tx-sender,
+            pass-type: pass-type,
+            balance: cost,
+            expiry-block: expiry-block,
+            active: true,
+            zone: zone,
+        })
+
+        (map-set loyalty-points tx-sender
+            (merge user-data { total-points: (- (get total-points user-data) points-to-redeem) })
+        )
+
+        (try! (add-pass-to-user tx-sender new-pass-id))
+        (var-set pass-counter new-pass-id)
+        (var-set total-revenue (+ (var-get total-revenue) discounted-cost))
+
+        (ok new-pass-id)
+    )
+)
+
+(define-public (set-tier-benefits
+        (tier uint)
+        (discount-percentage uint)
+        (bonus-points-multiplier uint)
+        (free-rides-monthly uint)
+    )
+    (begin
+        (asserts! (is-owner) ERR_NOT_AUTHORIZED)
+        (asserts! (and (>= tier u1) (<= tier u4)) ERR_INVALID_TIER)
+        (asserts! (<= discount-percentage u100) ERR_INVALID_AMOUNT)
+
+        (map-set tier-benefits tier {
+            discount-percentage: discount-percentage,
+            bonus-points-multiplier: bonus-points-multiplier,
+            free-rides-monthly: free-rides-monthly,
+        })
+
+        (ok true)
+    )
+)
+
 (define-read-only (get-pass-info (pass-id uint))
     (map-get? passes pass-id)
 )
@@ -360,6 +524,44 @@
     (match (map-get? passes pass-id)
         pass-data (some (get expiry-block pass-data))
         none
+    )
+)
+
+(define-read-only (get-user-loyalty-info (user principal))
+    (map-get? loyalty-points user)
+)
+
+(define-read-only (get-tier-benefits-info (tier uint))
+    (map-get? tier-benefits tier)
+)
+
+(define-read-only (calculate-discount-for-user
+        (user principal)
+        (pass-cost uint)
+    )
+    (match (map-get? loyalty-points user)
+        user-data (let ((tier (get tier user-data)))
+            (some (/ (* pass-cost (get-tier-discount tier)) u100))
+        )
+        none
+    )
+)
+
+(define-read-only (get-user-tier-name (user principal))
+    (match (map-get? loyalty-points user)
+        user-data (let ((tier (get tier user-data)))
+            (if (is-eq tier u4)
+                "Platinum"
+                (if (is-eq tier u3)
+                    "Gold"
+                    (if (is-eq tier u2)
+                        "Silver"
+                        "Bronze"
+                    )
+                )
+            )
+        )
+        "Unregistered"
     )
 )
 
