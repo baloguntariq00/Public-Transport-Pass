@@ -9,6 +9,12 @@
 (define-constant ERR_INVALID_ZONE (err u108))
 (define-constant ERR_INSUFFICIENT_POINTS (err u109))
 (define-constant ERR_INVALID_TIER (err u110))
+(define-constant ERR_GROUP_NOT_FOUND (err u111))
+(define-constant ERR_NOT_GROUP_ADMIN (err u112))
+(define-constant ERR_GROUP_FULL (err u113))
+(define-constant ERR_ALREADY_MEMBER (err u114))
+(define-constant ERR_NOT_MEMBER (err u115))
+(define-constant ERR_INVALID_GROUP_SIZE (err u116))
 
 (define-constant PASS_TYPE_DAILY u1)
 (define-constant PASS_TYPE_WEEKLY u2)
@@ -32,6 +38,7 @@
 (define-data-var contract-owner principal tx-sender)
 (define-data-var pass-counter uint u0)
 (define-data-var total-revenue uint u0)
+(define-data-var group-counter uint u0)
 
 (define-map passes
     uint
@@ -88,6 +95,37 @@
         bonus-points-multiplier: uint,
         free-rides-monthly: uint,
     }
+)
+
+(define-map group-passes
+    uint
+    {
+        admin: principal,
+        name: (string-ascii 50),
+        description: (string-ascii 200),
+        max-members: uint,
+        current-members: uint,
+        shared-balance: uint,
+        created-at: uint,
+        active: bool,
+    }
+)
+
+(define-map group-members
+    {
+        group-id: uint,
+        member: principal,
+    }
+    {
+        joined-at: uint,
+        total-rides: uint,
+        contribution: uint,
+    }
+)
+
+(define-map user-groups
+    principal
+    (list 5 uint)
 )
 
 (define-private (get-pass-cost (pass-type uint))
@@ -197,6 +235,32 @@
             last-activity: burn-block-height,
         })
         (ok bonus-points)
+    )
+)
+
+(define-private (is-group-admin (group-id uint) (user principal))
+    (match (map-get? group-passes group-id)
+        group-data (is-eq (get admin group-data) user)
+        false
+    )
+)
+
+(define-private (is-group-member (group-id uint) (user principal))
+    (is-some (map-get? group-members {
+        group-id: group-id,
+        member: user,
+    }))
+)
+
+;; Simplified member count - track it in group data
+(define-map group-member-counts uint uint)
+
+(define-private (add-user-to-group (user principal) (group-id uint))
+    (let ((current-groups (default-to (list) (map-get? user-groups user))))
+        (map-set user-groups user
+            (unwrap! (as-max-len? (append current-groups group-id) u5) (err u999))
+        )
+        (ok true)
     )
 )
 
@@ -467,6 +531,209 @@
     )
 )
 
+;; Group Pass Management Functions
+(define-public (create-group-pass
+        (name (string-ascii 50))
+        (description (string-ascii 200))
+        (max-members uint)
+        (initial-balance uint)
+    )
+    (let (
+            (new-group-id (+ (var-get group-counter) u1))
+            (current-block burn-block-height)
+        )
+        (asserts! (> max-members u0) ERR_INVALID_GROUP_SIZE)
+        (asserts! (<= max-members u10) ERR_INVALID_GROUP_SIZE)
+        (asserts! (> initial-balance u0) ERR_INVALID_AMOUNT)
+        (asserts! (> (len name) u0) ERR_INVALID_AMOUNT)
+
+        (try! (stx-transfer? initial-balance tx-sender (var-get contract-owner)))
+
+        (map-set group-passes new-group-id {
+            admin: tx-sender,
+            name: name,
+            description: description,
+            max-members: max-members,
+            current-members: u1,
+            shared-balance: initial-balance,
+            created-at: current-block,
+            active: true,
+        })
+
+        (map-set group-members {
+            group-id: new-group-id,
+            member: tx-sender,
+        } {
+            joined-at: current-block,
+            total-rides: u0,
+            contribution: initial-balance,
+        })
+
+        (try! (add-user-to-group tx-sender new-group-id))
+        (var-set group-counter new-group-id)
+        (var-set total-revenue (+ (var-get total-revenue) initial-balance))
+
+        (ok new-group-id)
+    )
+)
+
+(define-public (join-group
+        (group-id uint)
+        (contribution uint)
+    )
+    (let (
+            (group-data (unwrap! (map-get? group-passes group-id) ERR_GROUP_NOT_FOUND))
+            (current-block burn-block-height)
+        )
+        (asserts! (get active group-data) ERR_INVALID_PASS)
+        (asserts! (not (is-group-member group-id tx-sender)) ERR_ALREADY_MEMBER)
+        (asserts! (< (get current-members group-data) (get max-members group-data)) ERR_GROUP_FULL)
+        (asserts! (> contribution u0) ERR_INVALID_AMOUNT)
+
+        (try! (stx-transfer? contribution tx-sender (var-get contract-owner)))
+
+        (map-set group-members {
+            group-id: group-id,
+            member: tx-sender,
+        } {
+            joined-at: current-block,
+            total-rides: u0,
+            contribution: contribution,
+        })
+
+        (map-set group-passes group-id
+            (merge group-data {
+                shared-balance: (+ (get shared-balance group-data) contribution),
+                current-members: (+ (get current-members group-data) u1),
+            })
+        )
+
+        (try! (add-user-to-group tx-sender group-id))
+        (var-set total-revenue (+ (var-get total-revenue) contribution))
+
+        (ok true)
+    )
+)
+
+(define-public (contribute-to-group
+        (group-id uint)
+        (amount uint)
+    )
+    (let (
+            (group-data (unwrap! (map-get? group-passes group-id) ERR_GROUP_NOT_FOUND))
+            (member-data (unwrap! (map-get? group-members {
+                group-id: group-id,
+                member: tx-sender,
+            }) ERR_NOT_MEMBER))
+        )
+        (asserts! (get active group-data) ERR_INVALID_PASS)
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+
+        (try! (stx-transfer? amount tx-sender (var-get contract-owner)))
+
+        (map-set group-members {
+            group-id: group-id,
+            member: tx-sender,
+        }
+            (merge member-data { contribution: (+ (get contribution member-data) amount) })
+        )
+
+        (map-set group-passes group-id
+            (merge group-data { shared-balance: (+ (get shared-balance group-data) amount) })
+        )
+
+        (var-set total-revenue (+ (var-get total-revenue) amount))
+        (ok true)
+    )
+)
+
+(define-public (use-group-balance-for-ride
+        (group-id uint)
+        (from-zone uint)
+        (to-zone uint)
+    )
+    (let (
+            (group-data (unwrap! (map-get? group-passes group-id) ERR_GROUP_NOT_FOUND))
+            (member-data (unwrap! (map-get? group-members {
+                group-id: group-id,
+                member: tx-sender,
+            }) ERR_NOT_MEMBER))
+            (ride-cost (calculate-zone-cost from-zone to-zone))
+            (current-block burn-block-height)
+            (ride-id (+ (* group-id u10000) current-block))
+        )
+        (asserts! (get active group-data) ERR_INVALID_PASS)
+        (asserts! (>= (get shared-balance group-data) ride-cost) ERR_INSUFFICIENT_BALANCE)
+
+        (map-set group-passes group-id
+            (merge group-data { shared-balance: (- (get shared-balance group-data) ride-cost) })
+        )
+
+        (map-set group-members {
+            group-id: group-id,
+            member: tx-sender,
+        }
+            (merge member-data { total-rides: (+ (get total-rides member-data) u1) })
+        )
+
+        (map-set ride-history {
+            pass-id: group-id,
+            ride-id: ride-id,
+        } {
+            timestamp: current-block,
+            from-zone: from-zone,
+            to-zone: to-zone,
+            cost: ride-cost,
+        })
+
+        (begin
+            (unwrap-panic (award-points-for-ride tx-sender POINTS_PER_RIDE))
+            (ok ride-id)
+        )
+    )
+)
+
+(define-public (remove-group-member
+        (group-id uint)
+        (member principal)
+    )
+    (let (
+            (group-data (unwrap! (map-get? group-passes group-id) ERR_GROUP_NOT_FOUND))
+            (member-data (unwrap! (map-get? group-members {
+                group-id: group-id,
+                member: member,
+            }) ERR_NOT_MEMBER))
+        )
+        (asserts! (is-group-admin group-id tx-sender) ERR_NOT_GROUP_ADMIN)
+        (asserts! (not (is-eq member tx-sender)) ERR_NOT_AUTHORIZED)
+
+        (map-delete group-members {
+            group-id: group-id,
+            member: member,
+        })
+
+        (map-set group-passes group-id
+            (merge group-data { current-members: (- (get current-members group-data) u1) })
+        )
+
+        (ok true)
+    )
+)
+
+(define-public (deactivate-group
+        (group-id uint)
+    )
+    (let ((group-data (unwrap! (map-get? group-passes group-id) ERR_GROUP_NOT_FOUND)))
+        (asserts! (is-group-admin group-id tx-sender) ERR_NOT_GROUP_ADMIN)
+
+        (map-set group-passes group-id
+            (merge group-data { active: false })
+        )
+
+        (ok true)
+    )
+)
+
 (define-read-only (get-pass-info (pass-id uint))
     (map-get? passes pass-id)
 )
@@ -563,6 +830,46 @@
         )
         "Unregistered"
     )
+)
+
+;; Group Pass Read-Only Functions
+(define-read-only (get-group-info (group-id uint))
+    (map-get? group-passes group-id)
+)
+
+(define-read-only (get-group-member-info
+        (group-id uint)
+        (member principal)
+    )
+    (map-get? group-members {
+        group-id: group-id,
+        member: member,
+    })
+)
+
+(define-read-only (get-user-groups (user principal))
+    (map-get? user-groups user)
+)
+
+(define-read-only (is-user-group-member
+        (group-id uint)
+        (user principal)
+    )
+    (is-group-member group-id user)
+)
+
+(define-read-only (is-user-group-admin
+        (group-id uint)
+        (user principal)
+    )
+    (is-group-admin group-id user)
+)
+
+(define-read-only (get-group-stats)
+    {
+        total-groups: (var-get group-counter),
+        active-groups: (var-get group-counter),
+    }
 )
 
 (map-set zone-rates {
