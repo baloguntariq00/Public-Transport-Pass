@@ -238,14 +238,20 @@
     )
 )
 
-(define-private (is-group-admin (group-id uint) (user principal))
+(define-private (is-group-admin
+        (group-id uint)
+        (user principal)
+    )
     (match (map-get? group-passes group-id)
         group-data (is-eq (get admin group-data) user)
         false
     )
 )
 
-(define-private (is-group-member (group-id uint) (user principal))
+(define-private (is-group-member
+        (group-id uint)
+        (user principal)
+    )
     (is-some (map-get? group-members {
         group-id: group-id,
         member: user,
@@ -253,9 +259,15 @@
 )
 
 ;; Simplified member count - track it in group data
-(define-map group-member-counts uint uint)
+(define-map group-member-counts
+    uint
+    uint
+)
 
-(define-private (add-user-to-group (user principal) (group-id uint))
+(define-private (add-user-to-group
+        (user principal)
+        (group-id uint)
+    )
     (let ((current-groups (default-to (list) (map-get? user-groups user))))
         (map-set user-groups user
             (unwrap! (as-max-len? (append current-groups group-id) u5) (err u999))
@@ -587,7 +599,10 @@
         )
         (asserts! (get active group-data) ERR_INVALID_PASS)
         (asserts! (not (is-group-member group-id tx-sender)) ERR_ALREADY_MEMBER)
-        (asserts! (< (get current-members group-data) (get max-members group-data)) ERR_GROUP_FULL)
+        (asserts!
+            (< (get current-members group-data) (get max-members group-data))
+            ERR_GROUP_FULL
+        )
         (asserts! (> contribution u0) ERR_INVALID_AMOUNT)
 
         (try! (stx-transfer? contribution tx-sender (var-get contract-owner)))
@@ -621,10 +636,13 @@
     )
     (let (
             (group-data (unwrap! (map-get? group-passes group-id) ERR_GROUP_NOT_FOUND))
-            (member-data (unwrap! (map-get? group-members {
-                group-id: group-id,
-                member: tx-sender,
-            }) ERR_NOT_MEMBER))
+            (member-data (unwrap!
+                (map-get? group-members {
+                    group-id: group-id,
+                    member: tx-sender,
+                })
+                ERR_NOT_MEMBER
+            ))
         )
         (asserts! (get active group-data) ERR_INVALID_PASS)
         (asserts! (> amount u0) ERR_INVALID_AMOUNT)
@@ -654,16 +672,21 @@
     )
     (let (
             (group-data (unwrap! (map-get? group-passes group-id) ERR_GROUP_NOT_FOUND))
-            (member-data (unwrap! (map-get? group-members {
-                group-id: group-id,
-                member: tx-sender,
-            }) ERR_NOT_MEMBER))
+            (member-data (unwrap!
+                (map-get? group-members {
+                    group-id: group-id,
+                    member: tx-sender,
+                })
+                ERR_NOT_MEMBER
+            ))
             (ride-cost (calculate-zone-cost from-zone to-zone))
             (current-block burn-block-height)
             (ride-id (+ (* group-id u10000) current-block))
         )
         (asserts! (get active group-data) ERR_INVALID_PASS)
-        (asserts! (>= (get shared-balance group-data) ride-cost) ERR_INSUFFICIENT_BALANCE)
+        (asserts! (>= (get shared-balance group-data) ride-cost)
+            ERR_INSUFFICIENT_BALANCE
+        )
 
         (map-set group-passes group-id
             (merge group-data { shared-balance: (- (get shared-balance group-data) ride-cost) })
@@ -699,10 +722,13 @@
     )
     (let (
             (group-data (unwrap! (map-get? group-passes group-id) ERR_GROUP_NOT_FOUND))
-            (member-data (unwrap! (map-get? group-members {
-                group-id: group-id,
-                member: member,
-            }) ERR_NOT_MEMBER))
+            (member-data (unwrap!
+                (map-get? group-members {
+                    group-id: group-id,
+                    member: member,
+                })
+                ERR_NOT_MEMBER
+            ))
         )
         (asserts! (is-group-admin group-id tx-sender) ERR_NOT_GROUP_ADMIN)
         (asserts! (not (is-eq member tx-sender)) ERR_NOT_AUTHORIZED)
@@ -720,15 +746,11 @@
     )
 )
 
-(define-public (deactivate-group
-        (group-id uint)
-    )
+(define-public (deactivate-group (group-id uint))
     (let ((group-data (unwrap! (map-get? group-passes group-id) ERR_GROUP_NOT_FOUND)))
         (asserts! (is-group-admin group-id tx-sender) ERR_NOT_GROUP_ADMIN)
 
-        (map-set group-passes group-id
-            (merge group-data { active: false })
-        )
+        (map-set group-passes group-id (merge group-data { active: false }))
 
         (ok true)
     )
@@ -901,4 +923,95 @@
     from-zone: u3,
     to-zone: u3,
 } u1
+)
+
+(define-constant ERR_VOUCHER_NOT_FOUND (err u117))
+(define-constant ERR_VOUCHER_INACTIVE (err u118))
+(define-constant ERR_VOUCHER_EXPIRED (err u119))
+(define-constant ERR_VOUCHER_MAXED (err u120))
+(define-constant ERR_INVALID_DISCOUNT (err u121))
+
+(define-map vouchers
+    (string-ascii 32)
+    {
+        discount-percentage: uint,
+        max-uses: uint,
+        used-count: uint,
+        expiry-block: uint,
+        active: bool,
+    }
+)
+
+(define-public (create-voucher
+        (code (string-ascii 32))
+        (discount-percentage uint)
+        (max-uses uint)
+        (expiry-block uint)
+    )
+    (begin
+        (asserts! (is-owner) ERR_NOT_AUTHORIZED)
+        (asserts! (> discount-percentage u0) ERR_INVALID_DISCOUNT)
+        (asserts! (<= discount-percentage u100) ERR_INVALID_DISCOUNT)
+        (asserts! (> max-uses u0) ERR_INVALID_AMOUNT)
+        (asserts! (> expiry-block burn-block-height) ERR_INVALID_AMOUNT)
+        (map-set vouchers code {
+            discount-percentage: discount-percentage,
+            max-uses: max-uses,
+            used-count: u0,
+            expiry-block: expiry-block,
+            active: true,
+        })
+        (ok true)
+    )
+)
+
+(define-public (deactivate-voucher (code (string-ascii 32)))
+    (let ((v (unwrap! (map-get? vouchers code) ERR_VOUCHER_NOT_FOUND)))
+        (asserts! (is-owner) ERR_NOT_AUTHORIZED)
+        (map-set vouchers code (merge v { active: false }))
+        (ok true)
+    )
+)
+
+(define-public (purchase-pass-with-voucher
+        (pass-type uint)
+        (zone uint)
+        (code (string-ascii 32))
+    )
+    (let (
+            (v (unwrap! (map-get? vouchers code) ERR_VOUCHER_NOT_FOUND))
+            (cost (get-pass-cost pass-type))
+            (duration (get-pass-duration pass-type))
+            (current-block burn-block-height)
+            (new-pass-id (+ (var-get pass-counter) u1))
+            (expiry-block (+ current-block duration))
+            (discount-amount (/ (* cost (get discount-percentage v)) u100))
+            (discounted-cost (- cost discount-amount))
+        )
+        (asserts! (> cost u0) ERR_INVALID_PASS_TYPE)
+        (asserts! (> zone u0) ERR_INVALID_ZONE)
+        (asserts! (get active v) ERR_VOUCHER_INACTIVE)
+        (asserts! (< current-block (get expiry-block v)) ERR_VOUCHER_EXPIRED)
+        (asserts! (< (get used-count v) (get max-uses v)) ERR_VOUCHER_MAXED)
+        (try! (stx-transfer? discounted-cost tx-sender (var-get contract-owner)))
+        (map-set passes new-pass-id {
+            owner: tx-sender,
+            pass-type: pass-type,
+            balance: cost,
+            expiry-block: expiry-block,
+            active: true,
+            zone: zone,
+        })
+        (map-set vouchers code
+            (merge v { used-count: (+ (get used-count v) u1) })
+        )
+        (try! (add-pass-to-user tx-sender new-pass-id))
+        (var-set pass-counter new-pass-id)
+        (var-set total-revenue (+ (var-get total-revenue) discounted-cost))
+        (ok new-pass-id)
+    )
+)
+
+(define-read-only (get-voucher-info (code (string-ascii 32)))
+    (map-get? vouchers code)
 )
